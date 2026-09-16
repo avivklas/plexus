@@ -1,0 +1,153 @@
+package machine
+
+import (
+	"context"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/avivklas/plexus/pkg/store"
+	"github.com/hashicorp/raft"
+)
+
+// mockKVStore is a test store implementing store.Store.
+type mockKVStore struct {
+	store.BaseStore
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func newMockKVStore() *mockKVStore {
+	m := &mockKVStore{
+		BaseStore: store.NewBaseStore(),
+		data:      make(map[string]string),
+	}
+
+	store.HandleTyped(m.Router(), "kv.set", func(ctx context.Context, req struct{ Key, Val string }) (string, error) {
+		m.mu.Lock()
+		m.data[req.Key] = req.Val
+		m.mu.Unlock()
+		return "OK", nil
+	})
+
+	return m
+}
+
+func (m *mockKVStore) ID() store.StoreID {
+	return "mock-kv"
+}
+
+func (m *mockKVStore) Get(key string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.data[key]
+}
+
+func (m *mockKVStore) Snapshot() ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cmd, err := store.NewCommand("snap", m.data)
+	if err != nil {
+		return nil, err
+	}
+	return cmd.Marshal()
+}
+
+func (m *mockKVStore) Restore(b []byte) error {
+	cmd, err := store.UnmarshalCommand(b)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = make(map[string]string)
+	return cmd.Decode(&m.data)
+}
+
+func setupTestRaftMachine(t *testing.T, id string) (*RaftMachine, *mockKVStore) {
+	tmpDir, err := os.MkdirTemp("", "plexus-machine-test-*")
+	if err != nil {
+		t.Fatalf("create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	_, trans := raft.NewInmemTransport(raft.ServerAddress(id))
+
+	cfg := DefaultConfig(MachineID(id), &Node{ID: id, Address: id, Voter: true}, tmpDir)
+	cfg.Bootstrap = true
+	cfg.Transport = trans
+	cfg.SnapshotStore = raft.NewInmemSnapshotStore()
+	cfg.LogStore = raft.NewInmemStore()
+	cfg.StableStore = raft.NewInmemStore()
+	cfg.ApplyTimeout = 5 * time.Second
+
+	m := NewRaftMachine(cfg)
+	kv := newMockKVStore()
+	m.Register(kv)
+
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Stop() })
+
+	// Wait for leadership
+	deadline := time.Now().Add(5 * time.Second)
+	for !m.IsLeader() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for machine %s to become leader", id)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return m, kv
+}
+
+func TestRaftMachineApplyAndLocalRead(t *testing.T) {
+	m, kv := setupTestRaftMachine(t, "node-single")
+
+	// Propose mutation
+	res, err := m.Apply(context.Background(), "kv.set", struct{ Key, Val string }{
+		Key: "greeting",
+		Val: "hello plexus",
+	})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if res != "OK" {
+		t.Fatalf("expected result 'OK', got %v", res)
+	}
+
+	// Broken CAP / Quorum + Local Apply assertion:
+	// Because Apply() only returns after local FSM has applied the committed index,
+	// the value MUST immediately be readable from local state without any read barrier!
+	if !m.ShouldReadLocally() {
+		t.Fatalf("expected ShouldReadLocally to be true")
+	}
+
+	val := kv.Get("greeting")
+	if val != "hello plexus" {
+		t.Fatalf("expected 'hello plexus', got '%s'", val)
+	}
+
+	if m.LastCommittedIndex() == 0 {
+		t.Fatalf("expected non-zero committed index")
+	}
+}
+
+func TestRaftMachineSnapshot(t *testing.T) {
+	m, kv := setupTestRaftMachine(t, "node-snap")
+
+	_, err := m.Apply(context.Background(), "kv.set", struct{ Key, Val string }{Key: "user", Val: "Alice"})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	if err := m.TakeSnapshot(); err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+
+	if kv.Get("user") != "Alice" {
+		t.Fatalf("expected user=Alice")
+	}
+}
