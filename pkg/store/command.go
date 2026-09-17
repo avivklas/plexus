@@ -72,6 +72,27 @@ func (c *Command) Decode(target any) error {
 	return json.Unmarshal(c.Data, target)
 }
 
+// DecodeAs deserializes the command payload directly into a new value of type T.
+func (c *Command) DecodeAs[T any]() (T, error) {
+	var target T
+	if len(c.Data) == 0 {
+		return target, nil
+	}
+	if b, ok := any(&target).(*[]byte); ok {
+		*b = append([]byte(nil), c.Data...)
+		return target, nil
+	}
+	if s, ok := any(&target).(*string); ok {
+		*s = string(c.Data)
+		return target, nil
+	}
+	if err := json.Unmarshal(c.Data, &target); err != nil {
+		return target, err
+	}
+	return target, nil
+}
+
+
 // IdempotencyKey returns the idempotency key if present in metadata.
 func (c *Command) IdempotencyKey() string {
 	if c.Metadata == nil {

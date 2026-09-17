@@ -39,19 +39,20 @@ func New() *Store {
 		data:      make(map[string]string),
 	}
 
-	store.HandleTyped(s.Router(), CmdSet, func(ctx context.Context, p SetPayload) (string, error) {
+	s.Handle(CmdSet, func(ctx context.Context, p SetPayload) (string, error) {
 		s.mu.Lock()
 		s.data[p.Key] = p.Value
 		s.mu.Unlock()
 		return "OK", nil
 	})
 
-	store.HandleTyped(s.Router(), CmdDel, func(ctx context.Context, p DelPayload) (string, error) {
+	s.Handle(CmdDel, func(ctx context.Context, p DelPayload) (string, error) {
 		s.mu.Lock()
 		delete(s.data, p.Key)
 		s.mu.Unlock()
 		return "OK", nil
 	})
+
 
 	return s
 }

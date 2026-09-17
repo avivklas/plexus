@@ -135,3 +135,51 @@ func TestRouterPreHookAbort(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestGenericMethods(t *testing.T) {
+	// Test Command.DecodeAs
+	cmd, err := NewCommand("test.decode", sampleReq{Name: "David", Value: 99})
+	if err != nil {
+		t.Fatalf("NewCommand failed: %v", err)
+	}
+
+	decoded, err := cmd.DecodeAs[sampleReq]()
+	if err != nil {
+		t.Fatalf("DecodeAs failed: %v", err)
+	}
+	if decoded.Name != "David" || decoded.Value != 99 {
+		t.Errorf("unexpected decoded values from DecodeAs: %+v", decoded)
+	}
+
+	// Test Router.HandleTyped generic method
+	r := NewRouter()
+	r.HandleTyped("test.decode", func(ctx context.Context, req sampleReq) (sampleResp, error) {
+		return sampleResp{Greeting: "Hi " + req.Name, Doubled: req.Value * 2}, nil
+	})
+
+	res, err := r.Execute(context.Background(), cmd)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	resp := res.(sampleResp)
+	if resp.Greeting != "Hi David" || resp.Doubled != 198 {
+		t.Errorf("unexpected response from Router.HandleTyped: %+v", resp)
+	}
+
+
+	// Test BaseStore.Handle generic method
+	base := NewBaseStore()
+	base.Handle("test.base", func(ctx context.Context, req sampleReq) (string, error) {
+		return "Handled: " + req.Name, nil
+	})
+
+	baseCmd, _ := NewCommand("test.base", sampleReq{Name: "Eve"})
+	baseRes, err := base.Router().Execute(context.Background(), baseCmd)
+	if err != nil {
+		t.Fatalf("base Execute failed: %v", err)
+	}
+	if baseRes != "Handled: Eve" {
+		t.Errorf("unexpected baseRes: %v", baseRes)
+	}
+}
+

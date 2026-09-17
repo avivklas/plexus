@@ -1,6 +1,6 @@
 module github.com/avivklas/plexus
 
-go 1.26.3
+go 1.27.0
 
 require (
 	github.com/fatih/color v1.13.0 // indirect

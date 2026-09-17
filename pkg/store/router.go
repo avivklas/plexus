@@ -40,10 +40,9 @@ func (r *Router) Handle(cmdType CommandType, h CommandHandler) {
 	r.handlers[cmdType] = h
 }
 
-// HandleTyped registers a generic, type-safe handler for the given CommandType.
-// It automatically unmarshals JSON payloads into Req and marshals/returns Resp.
-func HandleTyped[Req any, Resp any](
-	r *Router,
+// HandleTyped registers a generic, type-safe handler for the given CommandType directly on the Router.
+// It automatically unmarshals JSON payloads into Req and returns Resp.
+func (r *Router) HandleTyped[Req any, Resp any](
 	cmdType CommandType,
 	fn func(ctx context.Context, req Req) (Resp, error),
 ) {
@@ -57,6 +56,17 @@ func HandleTyped[Req any, Resp any](
 		return fn(ctx, req)
 	})
 }
+
+// HandleTyped registers a generic, type-safe handler for the given CommandType.
+// Provided for backward compatibility; in Go 1.27+, r.HandleTyped can be invoked directly as a method.
+func HandleTyped[Req any, Resp any](
+	r *Router,
+	cmdType CommandType,
+	fn func(ctx context.Context, req Req) (Resp, error),
+) {
+	r.HandleTyped(cmdType, fn)
+}
+
 
 // GetHandler returns the registered handler for the given CommandType.
 func (r *Router) GetHandler(cmdType CommandType) (CommandHandler, bool) {

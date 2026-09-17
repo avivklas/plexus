@@ -89,6 +89,15 @@ func (b *BaseStore) Router() *Router {
 	return b.router
 }
 
+// Handle registers a generic, type-safe command handler directly on the store.
+func (b *BaseStore) Handle[Req any, Resp any](
+	cmdType CommandType,
+	fn func(ctx context.Context, req Req) (Resp, error),
+) {
+	b.Router().HandleTyped(cmdType, fn)
+}
+
+
 // PreHooks returns pre-hooks registered in the router.
 func (b *BaseStore) PreHooks() map[CommandType]PreHook {
 	return b.Router().PreHooks()

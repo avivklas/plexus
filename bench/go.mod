@@ -1,6 +1,6 @@
 module bench
 
-go 1.22
+go 1.27.0
 
 require go.etcd.io/bbolt v1.3.11
 
