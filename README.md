@@ -1,6 +1,6 @@
 # Plexus: Next-Gen Distributed State Machine & Raft Graph Framework
 
-[![Go Test](https://img.shields.io/badge/go-1.22%2B-blue)](https://golang.org)
+[![Go Test](https://img.shields.io/badge/go-1.27%2B-blue)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Plexus** is a modern Go framework for building high-performance, single-process distributed applications—inspired by HashiCorp Vault, Consul, and embedded Raft architectures.
