@@ -46,18 +46,17 @@ type MultiStoreFSM struct {
 	lastCommittedIndex atomic.Uint64
 	lastCommittedTerm  atomic.Uint64
 	observers          []LogCommitObserver
-	condMu             sync.Mutex
-	cond               *sync.Cond
+	waitMu             sync.Mutex
+	waiters            map[uint64][]chan struct{}
 }
 
 // NewMultiStoreFSM creates an empty MultiStoreFSM.
 func NewMultiStoreFSM() *MultiStoreFSM {
-	fsm := &MultiStoreFSM{
+	return &MultiStoreFSM{
 		stores:  make(map[store.StoreID]store.Store),
 		routers: make(map[store.CommandType]*store.Router),
+		waiters: make(map[uint64][]chan struct{}),
 	}
-	fsm.cond = sync.NewCond(&fsm.condMu)
-	return fsm
 }
 
 // RegisterStore registers a Store and its command routes with this FSM.
@@ -89,59 +88,61 @@ func (fsm *MultiStoreFSM) LastCommittedTerm() uint64 {
 	return fsm.lastCommittedTerm.Load()
 }
 
+func (fsm *MultiStoreFSM) notifyWaiters(appliedIndex uint64) {
+	fsm.waitMu.Lock()
+	if len(fsm.waiters) == 0 {
+		fsm.waitMu.Unlock()
+		return
+	}
+	for idx, list := range fsm.waiters {
+		if idx <= appliedIndex {
+			for _, ch := range list {
+				close(ch)
+			}
+			delete(fsm.waiters, idx)
+		}
+	}
+	fsm.waitMu.Unlock()
+}
+
 // WaitForIndex blocks until the local FSM has applied at least targetIndex or the context/timeout expires.
 func (fsm *MultiStoreFSM) WaitForIndex(ctx context.Context, targetIndex uint64, timeout time.Duration) error {
 	if fsm.lastCommittedIndex.Load() >= targetIndex {
 		return nil
 	}
 
+	fsm.waitMu.Lock()
+	if fsm.lastCommittedIndex.Load() >= targetIndex {
+		fsm.waitMu.Unlock()
+		return nil
+	}
+	waitCh := make(chan struct{})
+	fsm.waiters[targetIndex] = append(fsm.waiters[targetIndex], waitCh)
+	fsm.waitMu.Unlock()
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			fsm.condMu.Lock()
-			fsm.cond.Broadcast()
-			fsm.condMu.Unlock()
-		case <-timer.C:
-			fsm.condMu.Lock()
-			fsm.cond.Broadcast()
-			fsm.condMu.Unlock()
-		case <-done:
-		}
-	}()
-
-	fsm.condMu.Lock()
-	defer fsm.condMu.Unlock()
-
-	for fsm.lastCommittedIndex.Load() < targetIndex {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return fmt.Errorf("timeout waiting for local index %d, currently at %d", targetIndex, fsm.lastCommittedIndex.Load())
-		default:
-		}
-		fsm.cond.Wait()
+	select {
+	case <-waitCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timeout waiting for local index %d, currently at %d", targetIndex, fsm.lastCommittedIndex.Load())
 	}
-
-	return nil
 }
 
 // Apply implements raft.FSM by executing the command on the matching store router.
 func (fsm *MultiStoreFSM) Apply(l *raft.Log) any {
-	defer func() {
-		fsm.lastCommittedIndex.Store(l.Index)
-		fsm.lastCommittedTerm.Store(l.Term)
-		fsm.condMu.Lock()
-		fsm.cond.Broadcast()
-		fsm.condMu.Unlock()
-	}()
+	res := fsm.applySingle(l)
+	fsm.lastCommittedIndex.Store(l.Index)
+	fsm.lastCommittedTerm.Store(l.Term)
+	fsm.notifyWaiters(l.Index)
+	return res
+}
 
+func (fsm *MultiStoreFSM) applySingle(l *raft.Log) any {
 	if l.Type != raft.LogCommand {
 		return &ApplyResult{Index: l.Index, Term: l.Term}
 	}
@@ -194,7 +195,13 @@ func (fsm *MultiStoreFSM) Apply(l *raft.Log) any {
 func (fsm *MultiStoreFSM) ApplyBatch(logs []*raft.Log) []any {
 	res := make([]any, len(logs))
 	for i, l := range logs {
-		res[i] = fsm.Apply(l)
+		res[i] = fsm.applySingle(l)
+	}
+	if len(logs) > 0 {
+		last := logs[len(logs)-1]
+		fsm.lastCommittedIndex.Store(last.Index)
+		fsm.lastCommittedTerm.Store(last.Term)
+		fsm.notifyWaiters(last.Index)
 	}
 	return res
 }

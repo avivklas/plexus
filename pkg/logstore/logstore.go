@@ -23,6 +23,7 @@ type Config struct {
 	DirectIO     bool
 	MaxPayload   int
 	SyncOnAppend bool
+	LogCacheSize int
 }
 
 // DefaultConfig returns standard defaults for log storage.
@@ -33,6 +34,7 @@ func DefaultConfig(dataDir string) Config {
 		DirectIO:     false, // default to false for cross-platform portability
 		MaxPayload:   DefaultMaxPayloadSize,
 		SyncOnAppend: true,
+		LogCacheSize: DefaultLogCacheSize,
 	}
 }
 
@@ -58,6 +60,12 @@ type SegmentLogStore struct {
 	activeFile  *os.File
 	activeBase  uint64
 	activeSize  int64
+
+	fileMu      sync.RWMutex
+	openFiles   map[uint64]*os.File
+
+	cache       *logRingCache
+	closed      bool
 }
 
 // NewSegmentLogStore initializes and recovers a log store from the given data directory.
@@ -73,10 +81,12 @@ func NewSegmentLogStore(cfg Config) (*SegmentLogStore, error) {
 	}
 
 	store := &SegmentLogStore{
-		cfg:      cfg,
-		metadata: make(map[string][]byte),
-		metaFile: filepath.Join(cfg.DataDir, "meta.json"),
-		indexMap: make(map[uint64]indexEntry),
+		cfg:       cfg,
+		metadata:  make(map[string][]byte),
+		metaFile:  filepath.Join(cfg.DataDir, "meta.json"),
+		indexMap:  make(map[uint64]indexEntry),
+		openFiles: make(map[uint64]*os.File),
+		cache:     newLogRingCache(cfg.LogCacheSize),
 	}
 
 	if err := store.loadMetadata(); err != nil {
@@ -207,6 +217,17 @@ func (s *SegmentLogStore) recoverSegments() error {
 				s.lastIndex = eh.Index
 			}
 
+			var payloadData []byte
+			if len(fullEntry) > EntryHeaderSize+1 {
+				payloadData = fullEntry[EntryHeaderSize+1:]
+			}
+			s.cache.put(&raft.Log{
+				Index: eh.Index,
+				Term:  eh.Term,
+				Type:  logType,
+				Data:  payloadData,
+			})
+
 			offset += int64(fullSize)
 		}
 
@@ -273,23 +294,67 @@ func (s *SegmentLogStore) LastIndex() (uint64, error) {
 	return s.lastIndex, nil
 }
 
+func (s *SegmentLogStore) getSegmentFile(baseIndex uint64) (*os.File, error) {
+	s.fileMu.RLock()
+	if s.closed {
+		s.fileMu.RUnlock()
+		return nil, errors.New("log store is closed")
+	}
+	f, ok := s.openFiles[baseIndex]
+	s.fileMu.RUnlock()
+	if ok {
+		return f, nil
+	}
+
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.closed {
+		return nil, errors.New("log store is closed")
+	}
+	if f, ok := s.openFiles[baseIndex]; ok {
+		return f, nil
+	}
+
+	path := s.segmentPath(baseIndex)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open segment file: %w", err)
+	}
+	s.openFiles[baseIndex] = f
+	return f, nil
+}
+
+func (s *SegmentLogStore) closeSegmentFile(baseIndex uint64) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if f, ok := s.openFiles[baseIndex]; ok {
+		_ = f.Close()
+		delete(s.openFiles, baseIndex)
+	}
+}
+
 // GetLog retrieves a log entry by index.
 func (s *SegmentLogStore) GetLog(index uint64, log *raft.Log) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// 1. Fast path: check in-memory cache FIRST.
+	if s.cache.get(index, log) {
+		return nil
+	}
 
+	// 2. Fallback: look up index location in indexMap.
+	s.mu.RLock()
 	loc, ok := s.indexMap[index]
+	s.mu.RUnlock()
 	if !ok {
 		return raft.ErrLogNotFound
 	}
 
-	path := s.segmentPath(loc.baseIndex)
-	f, err := os.Open(path)
+	// 3. Obtain open file handle from openFiles cache without holding s.mu.
+	f, err := s.getSegmentFile(loc.baseIndex)
 	if err != nil {
 		return fmt.Errorf("open segment file: %w", err)
 	}
-	defer f.Close()
 
+	// 4. Disk ReadAt and CRC check executed WITHOUT holding s.mu.
 	buf := make([]byte, loc.size)
 	if _, err := f.ReadAt(buf, loc.offset); err != nil {
 		return fmt.Errorf("read entry at offset %d: %w", loc.offset, err)
@@ -373,6 +438,8 @@ func (s *SegmentLogStore) StoreLogs(logs []*raft.Log) error {
 		}
 	}
 
+	s.cache.putBatch(logs)
+
 	return nil
 }
 
@@ -380,6 +447,8 @@ func (s *SegmentLogStore) StoreLogs(logs []*raft.Log) error {
 func (s *SegmentLogStore) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.cache.deleteRange(min, max)
 
 	// Head compaction: min <= firstIndex
 	if min <= s.firstIndex {
@@ -429,6 +498,7 @@ func (s *SegmentLogStore) compactOldSegmentsLocked() {
 		nextBase := s.segments[i+1]
 		if nextBase <= s.firstIndex {
 			// This segment only contains indexes < firstIndex; unlink it
+			s.closeSegmentFile(base)
 			_ = os.Remove(s.segmentPath(base))
 		} else {
 			remaining = append(remaining, base)
@@ -475,15 +545,40 @@ func (s *SegmentLogStore) GetUint64(key []byte) (uint64, error) {
 	return binary.BigEndian.Uint64(val), nil
 }
 
-// Close closes all open segment files.
+// Close closes all open segment files and handles.
 func (s *SegmentLogStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.activeFile != nil {
-		_ = s.activeFile.Sync()
-		err := s.activeFile.Close()
-		s.activeFile = nil
-		return err
+
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	if s.closed {
+		return nil
 	}
-	return nil
+	s.closed = true
+
+	var firstErr error
+	if s.activeFile != nil {
+		if s.cfg.SyncOnAppend {
+			_ = s.activeFile.Sync()
+		}
+		if err := s.activeFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.activeFile = nil
+	}
+
+	for base, f := range s.openFiles {
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		delete(s.openFiles, base)
+	}
+
+	if s.cache != nil {
+		s.cache.clear()
+	}
+
+	return firstErr
 }
