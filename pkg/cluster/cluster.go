@@ -24,6 +24,8 @@ type Config struct {
 	ApplyTimeout  time.Duration
 	SyncLog                bool
 	FollowerWaitLocalApply bool
+	SnapshotThresh         uint64
+	TrailingLogs           uint64
 }
 
 // DefaultConfig returns standard cluster node defaults.
@@ -94,6 +96,12 @@ func New(cfg Config) (*Cluster, error) {
 	defaultMachCfg.ApplyTimeout = cfg.ApplyTimeout
 	defaultMachCfg.SyncLog = cfg.SyncLog
 	defaultMachCfg.FollowerWaitLocalApply = cfg.FollowerWaitLocalApply
+	if cfg.SnapshotThresh > 0 {
+		defaultMachCfg.SnapshotThresh = cfg.SnapshotThresh
+	}
+	if cfg.TrailingLogs > 0 {
+		defaultMachCfg.TrailingLogs = cfg.TrailingLogs
+	}
 
 	defaultMach := machine.NewRaftMachine(defaultMachCfg)
 	c.machines["default"] = defaultMach

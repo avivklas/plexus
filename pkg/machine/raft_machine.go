@@ -149,6 +149,12 @@ func (m *RaftMachine) Start(ctx context.Context) error {
 	raftConf.LeaderLeaseTimeout = 150 * time.Millisecond
 	raftConf.BatchApplyCh = true
 	raftConf.MaxAppendEntries = 128
+	if m.cfg.SnapshotThresh > 0 {
+		raftConf.SnapshotThreshold = m.cfg.SnapshotThresh
+	}
+	if m.cfg.TrailingLogs > 0 {
+		raftConf.TrailingLogs = m.cfg.TrailingLogs
+	}
 	raftConf.Logger = hclog.New(&hclog.LoggerOptions{
 		Name:   fmt.Sprintf("raft-%s", m.node.ID),
 		Level:  hclog.Warn,
