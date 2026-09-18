@@ -151,3 +151,62 @@ func TestRaftMachineSnapshot(t *testing.T) {
 		t.Fatalf("expected user=Alice")
 	}
 }
+
+func TestBatchingFSMApplyBatch(t *testing.T) {
+	fsm := NewMultiStoreFSM()
+	kv := newMockKVStore()
+	fsm.RegisterStore(kv)
+
+	// Verify BatchingFSM interface satisfaction
+	var batching raft.BatchingFSM = fsm
+
+	// Prepare a batch of commands
+	cmd1, err := store.NewCommand("kv.set", struct{ Key, Val string }{Key: "k1", Val: "v1"})
+	if err != nil {
+		t.Fatalf("create cmd1: %v", err)
+	}
+	b1, err := cmd1.Marshal()
+	if err != nil {
+		t.Fatalf("marshal cmd1: %v", err)
+	}
+
+	cmd2, err := store.NewCommand("kv.set", struct{ Key, Val string }{Key: "k2", Val: "v2"})
+	if err != nil {
+		t.Fatalf("create cmd2: %v", err)
+	}
+	b2, err := cmd2.Marshal()
+	if err != nil {
+		t.Fatalf("marshal cmd2: %v", err)
+	}
+
+	logs := []*raft.Log{
+		{Index: 1, Term: 1, Type: raft.LogCommand, Data: b1},
+		{Index: 2, Term: 1, Type: raft.LogCommand, Data: b2},
+	}
+
+	res := batching.ApplyBatch(logs)
+	if len(res) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(res))
+	}
+
+	for i, r := range res {
+		applyRes, ok := r.(*ApplyResult)
+		if !ok {
+			t.Fatalf("result %d expected *ApplyResult, got %T", i, r)
+		}
+		if applyRes.Err != "" {
+			t.Fatalf("result %d unexpected error: %s", i, applyRes.Err)
+		}
+		if applyRes.Res != "OK" {
+			t.Fatalf("result %d expected 'OK', got %v", i, applyRes.Res)
+		}
+	}
+
+	if kv.Get("k1") != "v1" || kv.Get("k2") != "v2" {
+		t.Fatalf("batch values not applied to KV store: k1=%s, k2=%s", kv.Get("k1"), kv.Get("k2"))
+	}
+
+	if fsm.LastCommittedIndex() != 2 {
+		t.Fatalf("expected LastCommittedIndex 2, got %d", fsm.LastCommittedIndex())
+	}
+}

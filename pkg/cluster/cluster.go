@@ -10,26 +10,31 @@ import (
 
 	"github.com/avivklas/plexus/pkg/machine"
 	"github.com/avivklas/plexus/pkg/store"
+	"github.com/hashicorp/raft"
 )
 
 // Config configures a single-process Plexus cluster node.
 type Config struct {
-	NodeID       string
-	BindAddr     string
-	DataDir      string
-	JoinAddrs    []string
-	Bootstrap    bool
-	ApplyTimeout time.Duration
+	NodeID        string
+	BindAddr      string
+	AdvertiseAddr string
+	DataDir       string
+	JoinAddrs     []string
+	Bootstrap     bool
+	ApplyTimeout  time.Duration
+	SyncLog                bool
+	FollowerWaitLocalApply bool
 }
 
 // DefaultConfig returns standard cluster node defaults.
 func DefaultConfig(nodeID, bindAddr, dataDir string) Config {
 	return Config{
-		NodeID:       nodeID,
-		BindAddr:     bindAddr,
-		DataDir:      dataDir,
-		ApplyTimeout: 30 * time.Second,
-		Bootstrap:    false,
+		NodeID:                 nodeID,
+		BindAddr:               bindAddr,
+		DataDir:                dataDir,
+		ApplyTimeout:           30 * time.Second,
+		Bootstrap:              false,
+		FollowerWaitLocalApply: true,
 	}
 }
 
@@ -41,6 +46,7 @@ type Cluster struct {
 	machines     map[machine.MachineID]*machine.RaftMachine
 	defaultMach  *machine.RaftMachine
 	rpcServer    *machine.RPCServer
+	mux          *machine.MuxListener
 	bootstrapped bool
 }
 
@@ -60,9 +66,14 @@ func New(cfg Config) (*Cluster, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
+	addr := cfg.AdvertiseAddr
+	if addr == "" {
+		addr = cfg.BindAddr
+	}
+
 	node := &machine.Node{
 		ID:      cfg.NodeID,
-		Address: cfg.BindAddr,
+		Address: addr,
 		Voter:   true,
 	}
 
@@ -81,6 +92,8 @@ func New(cfg Config) (*Cluster, error) {
 	defaultMachCfg.Bootstrap = cfg.Bootstrap
 	defaultMachCfg.JoinAddrs = cfg.JoinAddrs
 	defaultMachCfg.ApplyTimeout = cfg.ApplyTimeout
+	defaultMachCfg.SyncLog = cfg.SyncLog
+	defaultMachCfg.FollowerWaitLocalApply = cfg.FollowerWaitLocalApply
 
 	defaultMach := machine.NewRaftMachine(defaultMachCfg)
 	c.machines["default"] = defaultMach
@@ -139,13 +152,31 @@ func (c *Cluster) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 1. Start RPC Server if bind address provided
+	// 1. Initialize Network Multiplexer and RPC Server if bind address provided
 	if c.cfg.BindAddr != "" {
-		srv, err := machine.NewRPCServer(c.cfg.BindAddr, c.defaultMach)
-		if err != nil {
-			return fmt.Errorf("start cluster rpc server: %w", err)
+		if c.defaultMach.Transport() == nil {
+			adv := c.cfg.AdvertiseAddr
+			if adv == "" {
+				adv = c.cfg.BindAddr
+			}
+			mux, raftLayer, httpLn, err := machine.NewMuxListenerWithAdvertise(c.cfg.BindAddr, adv)
+			if err != nil {
+				return fmt.Errorf("init cluster mux on %s: %w", c.cfg.BindAddr, err)
+			}
+			c.mux = mux
+			c.defaultMach.WithTransport(raft.NewNetworkTransport(raftLayer, 5, 10*time.Second, os.Stderr))
+			srv, err := machine.NewRPCServerWithListener(httpLn, c.defaultMach)
+			if err != nil {
+				return fmt.Errorf("start cluster rpc server: %w", err)
+			}
+			c.rpcServer = srv
+		} else {
+			srv, err := machine.NewRPCServer(c.cfg.BindAddr, c.defaultMach)
+			if err != nil {
+				return fmt.Errorf("start cluster rpc server: %w", err)
+			}
+			c.rpcServer = srv
 		}
-		c.rpcServer = srv
 	}
 
 	// 2. Start all machines
@@ -165,6 +196,9 @@ func (c *Cluster) Stop() error {
 
 	if c.rpcServer != nil {
 		_ = c.rpcServer.Close()
+	}
+	if c.mux != nil {
+		_ = c.mux.Close()
 	}
 
 	for _, m := range c.machines {

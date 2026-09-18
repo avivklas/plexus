@@ -83,19 +83,22 @@ type Config struct {
 	ApplyTimeout   time.Duration
 	SnapshotThresh uint64
 	TrailingLogs   uint64
-	Bootstrap      bool
+	Bootstrap              bool
+	SyncLog                bool
+	FollowerWaitLocalApply bool
 }
 
 // DefaultConfig returns sensible defaults for machine configuration.
 func DefaultConfig(id MachineID, node *Node, dataDir string) Config {
 	return Config{
-		ID:             id,
-		Node:           node,
-		DataDir:        dataDir,
-		ApplyTimeout:   30 * time.Second,
-		SnapshotThresh: 10000,
-		TrailingLogs:   1000,
-		MaxVoters:      5,
-		Bootstrap:      false,
+		ID:                     id,
+		Node:                   node,
+		DataDir:                dataDir,
+		ApplyTimeout:           30 * time.Second,
+		SnapshotThresh:         10000,
+		TrailingLogs:           1000,
+		MaxVoters:              5,
+		Bootstrap:              false,
+		FollowerWaitLocalApply: true,
 	}
 }

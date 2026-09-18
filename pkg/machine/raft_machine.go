@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,6 +70,17 @@ func (m *RaftMachine) WithCustomStores(log raft.LogStore, stable raft.StableStor
 	return m
 }
 
+// WithTransport sets a custom transport for the RaftMachine.
+func (m *RaftMachine) WithTransport(trans raft.Transport) *RaftMachine {
+	m.cfg.Transport = trans
+	return m
+}
+
+// Transport returns the configured custom transport, if any.
+func (m *RaftMachine) Transport() raft.Transport {
+	return m.cfg.Transport
+}
+
 // ID returns the Machine ID.
 func (m *RaftMachine) ID() MachineID {
 	return m.cfg.ID
@@ -94,7 +106,9 @@ func (m *RaftMachine) Start(ctx context.Context) error {
 		m.logStore = m.cfg.LogStore
 		m.stableStore = m.cfg.StableStore
 	} else {
-		ls, err := logstore.NewSegmentLogStore(logstore.DefaultConfig(raftDir))
+		logCfg := logstore.DefaultConfig(raftDir)
+		logCfg.SyncOnAppend = m.cfg.SyncLog
+		ls, err := logstore.NewSegmentLogStore(logCfg)
 		if err != nil {
 			return fmt.Errorf("init segment log store: %w", err)
 		}
@@ -129,7 +143,17 @@ func (m *RaftMachine) Start(ctx context.Context) error {
 	raftConf := raft.DefaultConfig()
 	raftConf.LocalID = raft.ServerID(m.node.ID)
 	raftConf.LogLevel = "WARN"
-	raftConf.Logger = hclog.NewNullLogger()
+	raftConf.CommitTimeout = 1 * time.Millisecond
+	raftConf.HeartbeatTimeout = 250 * time.Millisecond
+	raftConf.ElectionTimeout = 250 * time.Millisecond
+	raftConf.LeaderLeaseTimeout = 150 * time.Millisecond
+	raftConf.BatchApplyCh = true
+	raftConf.MaxAppendEntries = 128
+	raftConf.Logger = hclog.New(&hclog.LoggerOptions{
+		Name:   fmt.Sprintf("raft-%s", m.node.ID),
+		Level:  hclog.Warn,
+		Output: os.Stderr,
+	})
 
 	r, err := raft.NewRaft(raftConf, m.fsm, m.logStore, m.stableStore, m.snapshotStore, m.transport)
 	if err != nil {
@@ -165,15 +189,26 @@ func (m *RaftMachine) autoJoin(addrs []string) {
 		Voter:   m.node.Voter,
 	}
 
-	for _, addr := range addrs {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		res, err := m.rpcClient.JoinNode(ctx, addr, node)
-		cancel()
-		if err == nil && res.Error == "" {
-			_ = m.waitForLocalIndex(context.Background(), res.CommittedIndex)
+	for attempt := 0; attempt < 60; attempt++ {
+		select {
+		case <-m.closeCh:
 			return
+		default:
 		}
+		for _, addr := range addrs {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			res, err := m.rpcClient.JoinNode(ctx, addr, node)
+			cancel()
+			log.Printf("[AUTO-JOIN] Attempt %d: Node %s joining %s (node addr=%s): err=%v, res=%+v", attempt, m.node.ID, addr, node.Address, err, res)
+			if err == nil && res.Error == "" {
+				log.Printf("[AUTO-JOIN] Node %s successfully joined cluster via %s (committed index %d)", m.node.ID, addr, res.CommittedIndex)
+				_ = m.waitForLocalIndex(context.Background(), res.CommittedIndex)
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
+	log.Printf("[AUTO-JOIN] Warning: Node %s exhausted retries trying to join cluster peers: %v", m.node.ID, addrs)
 }
 
 func (m *RaftMachine) observeRaft() {
@@ -281,7 +316,9 @@ func (m *RaftMachine) ApplyCommand(ctx context.Context, cmd *store.Command) (any
 		return nil, ErrNoLeader
 	}
 
+	startForward := time.Now()
 	resp, err := m.rpcClient.ApplyOnNode(ctx, leader.Address, cmd)
+	durForward := time.Since(startForward)
 	if err != nil {
 		return nil, fmt.Errorf("forward command to leader %s: %w", leader.Address, err)
 	}
@@ -289,9 +326,16 @@ func (m *RaftMachine) ApplyCommand(ctx context.Context, cmd *store.Command) (any
 		return nil, errors.New(resp.Error)
 	}
 
-	// Crucial: Wait until THIS follower's local FSM has applied the committed index!
-	if err := m.waitForLocalIndex(ctx, resp.Index); err != nil {
-		return nil, fmt.Errorf("wait for follower local apply index %d: %w", resp.Index, err)
+	// Wait until THIS follower's local FSM has applied the committed index if configured
+	if m.cfg.FollowerWaitLocalApply {
+		startWait := time.Now()
+		if err := m.waitForLocalIndex(ctx, resp.Index); err != nil {
+			return nil, fmt.Errorf("wait for follower local apply index %d: %w", resp.Index, err)
+		}
+		durWait := time.Since(startWait)
+		if durWait > 10*time.Millisecond {
+			log.Printf("[PERF-DIAG] Follower %s: Forwarded in %v, then stalled in waitForLocalIndex(%d) for %v", m.node.ID, durForward, resp.Index, durWait)
+		}
 	}
 
 	var res any
@@ -312,13 +356,6 @@ func (m *RaftMachine) applyLeader(ctx context.Context, cmd *store.Command) (any,
 		return nil, fmt.Errorf("raft apply: %w", err)
 	}
 
-	committedIndex := future.Index()
-
-	// Crucial: Wait for local state machine apply on the leader!
-	if err := m.waitForLocalIndex(ctx, committedIndex); err != nil {
-		return nil, fmt.Errorf("wait for leader local apply index %d: %w", committedIndex, err)
-	}
-
 	res := future.Response()
 	if applyRes, ok := res.(*ApplyResult); ok {
 		if applyRes.Err != "" {
@@ -331,28 +368,10 @@ func (m *RaftMachine) applyLeader(ctx context.Context, cmd *store.Command) (any,
 }
 
 func (m *RaftMachine) waitForLocalIndex(ctx context.Context, expectedIndex uint64) error {
-	if expectedIndex == 0 {
+	if expectedIndex == 0 || m.fsm.LastCommittedIndex() >= expectedIndex {
 		return nil
 	}
-
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-
-	timeoutCh := time.After(m.cfg.ApplyTimeout)
-
-	for {
-		if m.fsm.LastCommittedIndex() >= expectedIndex {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeoutCh:
-			return fmt.Errorf("%w: waiting for local index %d, currently at %d", ErrTimeout, expectedIndex, m.fsm.LastCommittedIndex())
-		case <-ticker.C:
-		}
-	}
+	return m.fsm.WaitForIndex(ctx, expectedIndex, m.cfg.ApplyTimeout)
 }
 
 // HandleJoin implements RPCHandler.
@@ -419,6 +438,10 @@ func (m *RaftMachine) Stop() error {
 
 	if m.rpcServer != nil {
 		_ = m.rpcServer.Close()
+	}
+
+	if m.rpcClient != nil {
+		_ = m.rpcClient.Close()
 	}
 
 	if m.raft != nil {

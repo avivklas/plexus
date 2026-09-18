@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/avivklas/plexus/pkg/store"
 	"github.com/hashicorp/raft"
@@ -31,7 +32,13 @@ type ApplyResult struct {
 // LogCommitObserver is called whenever a log entry is successfully applied to the FSM.
 type LogCommitObserver func(term, index uint64, cmd *store.Command, res any, err error)
 
-// MultiStoreFSM implements raft.FSM and multiplexes commands to registered stores.
+// Ensure MultiStoreFSM implements raft.FSM and raft.BatchingFSM.
+var (
+	_ raft.FSM         = (*MultiStoreFSM)(nil)
+	_ raft.BatchingFSM = (*MultiStoreFSM)(nil)
+)
+
+// MultiStoreFSM implements raft.FSM and raft.BatchingFSM, multiplexing commands to registered stores.
 type MultiStoreFSM struct {
 	mu                 sync.RWMutex
 	stores             map[store.StoreID]store.Store
@@ -39,14 +46,18 @@ type MultiStoreFSM struct {
 	lastCommittedIndex atomic.Uint64
 	lastCommittedTerm  atomic.Uint64
 	observers          []LogCommitObserver
+	condMu             sync.Mutex
+	cond               *sync.Cond
 }
 
 // NewMultiStoreFSM creates an empty MultiStoreFSM.
 func NewMultiStoreFSM() *MultiStoreFSM {
-	return &MultiStoreFSM{
+	fsm := &MultiStoreFSM{
 		stores:  make(map[store.StoreID]store.Store),
 		routers: make(map[store.CommandType]*store.Router),
 	}
+	fsm.cond = sync.NewCond(&fsm.condMu)
+	return fsm
 }
 
 // RegisterStore registers a Store and its command routes with this FSM.
@@ -78,11 +89,57 @@ func (fsm *MultiStoreFSM) LastCommittedTerm() uint64 {
 	return fsm.lastCommittedTerm.Load()
 }
 
+// WaitForIndex blocks until the local FSM has applied at least targetIndex or the context/timeout expires.
+func (fsm *MultiStoreFSM) WaitForIndex(ctx context.Context, targetIndex uint64, timeout time.Duration) error {
+	if fsm.lastCommittedIndex.Load() >= targetIndex {
+		return nil
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			fsm.condMu.Lock()
+			fsm.cond.Broadcast()
+			fsm.condMu.Unlock()
+		case <-timer.C:
+			fsm.condMu.Lock()
+			fsm.cond.Broadcast()
+			fsm.condMu.Unlock()
+		case <-done:
+		}
+	}()
+
+	fsm.condMu.Lock()
+	defer fsm.condMu.Unlock()
+
+	for fsm.lastCommittedIndex.Load() < targetIndex {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for local index %d, currently at %d", targetIndex, fsm.lastCommittedIndex.Load())
+		default:
+		}
+		fsm.cond.Wait()
+	}
+
+	return nil
+}
+
 // Apply implements raft.FSM by executing the command on the matching store router.
 func (fsm *MultiStoreFSM) Apply(l *raft.Log) any {
 	defer func() {
 		fsm.lastCommittedIndex.Store(l.Index)
 		fsm.lastCommittedTerm.Store(l.Term)
+		fsm.condMu.Lock()
+		fsm.cond.Broadcast()
+		fsm.condMu.Unlock()
 	}()
 
 	if l.Type != raft.LogCommand {
@@ -131,6 +188,15 @@ func (fsm *MultiStoreFSM) Apply(l *raft.Log) any {
 	}
 
 	return applyRes
+}
+
+// ApplyBatch implements raft.BatchingFSM by applying a slice of committed logs in order.
+func (fsm *MultiStoreFSM) ApplyBatch(logs []*raft.Log) []any {
+	res := make([]any, len(logs))
+	for i, l := range logs {
+		res[i] = fsm.Apply(l)
+	}
+	return res
 }
 
 // Snapshot implements raft.FSM by serializing all registered stores.
